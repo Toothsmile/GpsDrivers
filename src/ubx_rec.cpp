@@ -55,7 +55,7 @@
 #include <string.h>
 #include <ctime>
 
-#include "ubx.h"
+#include "ubx_rec.h"
 
 #define UBX_CONFIG_TIMEOUT	200		// ms, timeout for waiting ACK
 #define UBX_PACKET_TIMEOUT	2		// ms, if now data during this delay assume that full update received
@@ -69,256 +69,249 @@
 
 
 /**** Trace macros, disable for production builds */
-#define UBX_TRACE_PARSER(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* decoding progress in parse_char() */
-#define UBX_TRACE_RXMSG(...)		{/*GPS_INFO(__VA_ARGS__);*/}	/* Rx msgs in payload_rx_done() */
-#define UBX_TRACE_SVINFO(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
+#define UBX_REC_TRACE_PARSER(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* decoding progress in parse_char() */
+#define UBX_REC_TRACE_RXMSG(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* Rx msgs in payload_rx_done() */
+#define UBX_REC_TRACE_SVINFO(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
+#define UBX_REC_TRACE_RXID(...)		{/*GPS_INFO(__VA_ARGS__);*/}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
 
 /**** Warning macros, disable to save memory */
-#define UBX_WARN(...)		{GPS_WARN(__VA_ARGS__);}
-#define UBX_DEBUG(...)		{/*GPS_WARN(__VA_ARGS__);*/}
+#define UBX_REC_WARN(...)		{/*GPS_WARN(__VA_ARGS__);*/}
+#define UBX_REC_DEBUG(...)		{/*GPS_WARN(__VA_ARGS__);*/}
 
-GPSDriverUBX::GPSDriverUBX(Interface gpsInterface, GPSCallbackPtr callback, void *callback_user,
-			   struct vehicle_gps_position_s *gps_position,
-			   struct satellite_info_s *satellite_info,
-			   uint8_t dynamic_model)
-	: GPSHelper(callback, callback_user)
-	, _gps_position(gps_position)
-	, _satellite_info(satellite_info)
-	, _interface(gpsInterface)
-	, _survey_in_acc_limit(UBX_TX_CFG_TMODE3_SVINACCLIMIT)
-	, _survey_in_min_dur(UBX_TX_CFG_TMODE3_SVINMINDUR)
-	, _dyn_model(dynamic_model)
+GPSDriverUBX_rec::GPSDriverUBX_rec(GPSCallbackPtr callback, void *callback_user, struct vehicle_gps_position_s *gps_position,
+			   struct satellite_info_s *satellite_info) :
+	GPSHelper(callback, callback_user),
+	_gps_position(gps_position),
+	_satellite_info(satellite_info),
+	_last_timestamp_time(0),
+	_configured(false),
+	_ack_state(UBX_ACK_IDLE),
+	_got_posllh(false),
+	_got_velned(false),
+	_disable_cmd_last(0),
+	_ack_waiting_msg(0),
+	_ubx_version(0),
+	_use_nav_pvt(false)
 {
 	decodeInit();
 }
 
-GPSDriverUBX::~GPSDriverUBX()
+GPSDriverUBX_rec::~GPSDriverUBX_rec()
 {
 	if (_rtcm_message) {
 		delete[](_rtcm_message->buffer);
-		delete (_rtcm_message);
+		delete(_rtcm_message);
 	}
 }
 
 int
-GPSDriverUBX::configure(unsigned &baudrate, OutputMode output_mode)
+GPSDriverUBX_rec::configure(unsigned &baudrate, OutputMode output_mode)
 {
-	_configured = false;
-	_output_mode = output_mode;
-	/* try different baudrates */
-	const unsigned baudrates[] = {38400, 57600, 9600, 19200, 115200};
-
-	unsigned baud_i;
-	ubx_payload_tx_cfg_prt_t cfg_prt[2];
-	uint16_t out_proto_mask = output_mode == OutputMode::GPS ?
-				  UBX_TX_CFG_PRT_OUTPROTOMASK_GPS :
-				  UBX_TX_CFG_PRT_OUTPROTOMASK_RTCM;
-	uint16_t in_proto_mask = output_mode == OutputMode::GPS ?
-				 UBX_TX_CFG_PRT_INPROTOMASK_GPS :
-				 UBX_TX_CFG_PRT_INPROTOMASK_RTCM;
-	//FIXME: RTCM3 output needs at least protocol version 20. The protocol version can be checked via the version
-	//output:
-	//WARN  VER ext "                  PROTVER=20.00"
-	//However this is a string and it is not well documented, that PROTVER is always contained. Maybe there is a
-	//better way to check the protocol version?
-
-
-    if (_interface == Interface::UART) {//这里是需要改的啊
-		for (baud_i = 0; baud_i < sizeof(baudrates) / sizeof(baudrates[0]); baud_i++) {
-			baudrate = baudrates[baud_i];
-			setBaudrate(baudrate);
-
-			/* flush input and wait for at least 20 ms silence */
-			decodeInit();
-			receive(20);
-			decodeInit();
-
-			/* Send a CFG-PRT message to set the UBX protocol for in and out
-			 * and leave the baudrate as it is, we just want an ACK-ACK for this */
-			memset(cfg_prt, 0, 2 * sizeof(ubx_payload_tx_cfg_prt_t));
-			cfg_prt[0].portID		= UBX_TX_CFG_PRT_PORTID;
-			cfg_prt[0].mode		= UBX_TX_CFG_PRT_MODE;
-			cfg_prt[0].baudRate	= baudrate;
-			cfg_prt[0].inProtoMask	= in_proto_mask;
-			cfg_prt[0].outProtoMask	= out_proto_mask;
-			cfg_prt[1].portID		= UBX_TX_CFG_PRT_PORTID_USB;
-			cfg_prt[1].mode		= UBX_TX_CFG_PRT_MODE;
-			cfg_prt[1].baudRate	= baudrate;
-			cfg_prt[1].inProtoMask	= in_proto_mask;
-			cfg_prt[1].outProtoMask	= out_proto_mask;
-
-			if (!sendMessage(UBX_MSG_CFG_PRT, (uint8_t *)cfg_prt, 2 * sizeof(ubx_payload_tx_cfg_prt_t))) {
-				continue;
-			}
-
-			if (waitForAck(UBX_MSG_CFG_PRT, UBX_CONFIG_TIMEOUT, false) < 0) {
-				/* try next baudrate */
-				continue;
-			}
-
-			/* Send a CFG-PRT message again, this time change the baudrate */
-			memset(cfg_prt, 0, 2 * sizeof(ubx_payload_tx_cfg_prt_t));
-			cfg_prt[0].portID		= UBX_TX_CFG_PRT_PORTID;
-			cfg_prt[0].mode		= UBX_TX_CFG_PRT_MODE;
-			cfg_prt[0].baudRate	= UBX_TX_CFG_PRT_BAUDRATE;
-			cfg_prt[0].inProtoMask	= in_proto_mask;
-			cfg_prt[0].outProtoMask	= out_proto_mask;
-			cfg_prt[1].portID		= UBX_TX_CFG_PRT_PORTID_USB;
-			cfg_prt[1].mode		= UBX_TX_CFG_PRT_MODE;
-			cfg_prt[1].baudRate	= UBX_TX_CFG_PRT_BAUDRATE;
-			cfg_prt[1].inProtoMask	= in_proto_mask;
-			cfg_prt[1].outProtoMask	= out_proto_mask;
-
-			if (!sendMessage(UBX_MSG_CFG_PRT, (uint8_t *)cfg_prt, 2 * sizeof(ubx_payload_tx_cfg_prt_t))) {
-				continue;
-			}
-
-			/* no ACK is expected here, but read the buffer anyway in case we actually get an ACK */
-			waitForAck(UBX_MSG_CFG_PRT, UBX_CONFIG_TIMEOUT, false);
-
-			if (UBX_TX_CFG_PRT_BAUDRATE != baudrate) {
-				setBaudrate(UBX_TX_CFG_PRT_BAUDRATE);
-				baudrate = UBX_TX_CFG_PRT_BAUDRATE;
-			}
-
-			/* at this point we have correct baudrate on both ends */
-			break;
-		}
-
-		if (baud_i >= sizeof(baudrates) / sizeof(baudrates[0])) {
-			return -1;	// connection and/or baudrate detection failed
-		}
-
-	} else if (_interface == Interface::SPI) {
-		memset(cfg_prt, 0, 2 * sizeof(ubx_payload_tx_cfg_prt_t));
-		cfg_prt[0].portID		= UBX_TX_CFG_PRT_PORTID_SPI;
-		cfg_prt[0].mode			= UBX_TX_CFG_PRT_MODE_SPI;
-		cfg_prt[0].inProtoMask	= in_proto_mask;
-		cfg_prt[0].outProtoMask	= out_proto_mask;
-
-		if (!sendMessage(UBX_MSG_CFG_PRT, (uint8_t *)cfg_prt, sizeof(ubx_payload_tx_cfg_prt_t))) {
-			return -1;
-		}
-
-		/* no ACK is expected here, but read the buffer anyway in case we actually get an ACK */
-		waitForAck(UBX_MSG_CFG_PRT, UBX_CONFIG_TIMEOUT, false);
-
-	} else {
-		return -1;
-	}
-
-	/* Send a CFG-RATE message to define update rate */
-	memset(&_buf.payload_tx_cfg_rate, 0, sizeof(_buf.payload_tx_cfg_rate));
-	_buf.payload_tx_cfg_rate.measRate	= UBX_TX_CFG_RATE_MEASINTERVAL;
-	_buf.payload_tx_cfg_rate.navRate	= UBX_TX_CFG_RATE_NAVRATE;
-	_buf.payload_tx_cfg_rate.timeRef	= UBX_TX_CFG_RATE_TIMEREF;
-
-	if (!sendMessage(UBX_MSG_CFG_RATE, (uint8_t *)&_buf, sizeof(_buf.payload_tx_cfg_rate))) {
-		return -1;
-	}
-
-	if (waitForAck(UBX_MSG_CFG_RATE, UBX_CONFIG_TIMEOUT, true) < 0) {
-		return -1;
-	}
-
-	if (output_mode != OutputMode::GPS) {
-		// RTCM mode force stationary dynamic model
-		_dyn_model = 2;
-	}
-
-	/* send a NAV5 message to set the options for the internal filter */
-	memset(&_buf.payload_tx_cfg_nav5, 0, sizeof(_buf.payload_tx_cfg_nav5));
-	_buf.payload_tx_cfg_nav5.mask		= UBX_TX_CFG_NAV5_MASK;
-	_buf.payload_tx_cfg_nav5.dynModel	= _dyn_model;
-	_buf.payload_tx_cfg_nav5.fixMode	= UBX_TX_CFG_NAV5_FIXMODE;
-
-	if (!sendMessage(UBX_MSG_CFG_NAV5, (uint8_t *)&_buf, sizeof(_buf.payload_tx_cfg_nav5))) {
-		return -1;
-	}
-
-	if (waitForAck(UBX_MSG_CFG_NAV5, UBX_CONFIG_TIMEOUT, true) < 0) {
-		return -1;
-	}
-
-#ifdef UBX_CONFIGURE_SBAS
-	/* send a SBAS message to set the SBAS options */
-	memset(&_buf.payload_tx_cfg_sbas, 0, sizeof(_buf.payload_tx_cfg_sbas));
-	_buf.payload_tx_cfg_sbas.mode		= UBX_TX_CFG_SBAS_MODE;
-
-	if (!sendMessage(UBX_MSG_CFG_SBAS, (uint8_t *)&_buf, sizeof(_buf.payload_tx_cfg_sbas))) {
-		return -1;
-	}
-
-	if (waitForAck(UBX_MSG_CFG_SBAS, UBX_CONFIG_TIMEOUT, true) < 0) {
-		return -1;
-	}
-
-#endif
-
-	/* configure message rates */
-	/* the last argument is divisor for measurement rate (set by CFG RATE), i.e. 1 means 5Hz */
-
-	/* try to set rate for NAV-PVT */
-	/* (implemented for ubx7+ modules only, use NAV-SOL, NAV-POSLLH, NAV-VELNED and NAV-TIMEUTC for ubx6) */
-	if (!configureMessageRate(UBX_MSG_NAV_PVT, 1)) {
-		return -1;
-	}
-
-	if (waitForAck(UBX_MSG_CFG_MSG, UBX_CONFIG_TIMEOUT, true) < 0) {
-		_use_nav_pvt = false;
-
-	} else {
-		_use_nav_pvt = true;
-	}
-
-	UBX_DEBUG("%susing NAV-PVT", _use_nav_pvt ? "" : "not ");
-
-	if (!_use_nav_pvt) {
-		if (!configureMessageRateAndAck(UBX_MSG_NAV_TIMEUTC, 5, true)) {
-			return -1;
-		}
-
-		if (!configureMessageRateAndAck(UBX_MSG_NAV_POSLLH, 1, true)) {
-			return -1;
-		}
-
-		if (!configureMessageRateAndAck(UBX_MSG_NAV_SOL, 1, true)) {
-			return -1;
-		}
-
-		if (!configureMessageRateAndAck(UBX_MSG_NAV_VELNED, 1, true)) {
-			return -1;
-		}
-	}
-
-	if (!configureMessageRateAndAck(UBX_MSG_NAV_DOP, 1, true)) {
-		return -1;
-	}
-
-	if (!configureMessageRateAndAck(UBX_MSG_NAV_SVINFO, (_satellite_info != nullptr) ? 5 : 0, true)) {
-		return -1;
-	}
-
-	if (!configureMessageRateAndAck(UBX_MSG_MON_HW, 1, true)) {
-		return -1;
-	}
-
-	/* request module version information by sending an empty MON-VER message */
-	if (!sendMessage(UBX_MSG_MON_VER, nullptr, 0)) {
-		return -1;
-	}
-
-	if (output_mode == OutputMode::RTCM) {
-		if (restartSurveyIn() < 0) {
-			return -1;
-		}
-	}
-
 	_configured = true;
+	_output_mode = output_mode;
+	_use_nav_pvt = false;
+	setBaudrate(115200);
 	return 0;
 }
+//int
+//GPSDriverUBX::configure(unsigned &baudrate, OutputMode output_mode)
+//{
+//	_configured = false;
+//	_output_mode = output_mode;
+//	/* try different baudrates */
+//	const unsigned baudrates[] = {9600, 38400, 19200, 57600, 115200};
+//
+//	unsigned baud_i;
+//	ubx_payload_tx_cfg_prt_t cfg_prt[2];
+//	uint16_t out_proto_mask = output_mode == OutputMode::GPS ?
+//				  UBX_TX_CFG_PRT_OUTPROTOMASK_GPS :
+//				  UBX_TX_CFG_PRT_OUTPROTOMASK_RTCM;
+//	uint16_t in_proto_mask = output_mode == OutputMode::GPS ?
+//				 UBX_TX_CFG_PRT_INPROTOMASK_GPS :
+//				 UBX_TX_CFG_PRT_INPROTOMASK_RTCM;
+//	//FIXME: RTCM3 output needs at least protocol version 20. The protocol version can be checked via the version
+//	//output:
+//	//WARN  VER ext "                  PROTVER=20.00"
+//	//However this is a string and it is not well documented, that PROTVER is always contained. Maybe there is a
+//	//better way to check the protocol version?
+//
+//
+//	for (baud_i = 0; baud_i < sizeof(baudrates) / sizeof(baudrates[0]); baud_i++) {
+//		baudrate = baudrates[baud_i];
+//		setBaudrate(baudrate);
+//
+//		/* flush input and wait for at least 20 ms silence */
+//		decodeInit();
+//		receive(20);
+//		decodeInit();
+//
+//		/* Send a CFG-PRT message to set the UBX protocol for in and out
+//		 * and leave the baudrate as it is, we just want an ACK-ACK for this */
+//		memset(cfg_prt, 0, 2 * sizeof(ubx_payload_tx_cfg_prt_t));
+//		cfg_prt[0].portID		= UBX_TX_CFG_PRT_PORTID;
+//		cfg_prt[0].mode		= UBX_TX_CFG_PRT_MODE;
+//		cfg_prt[0].baudRate	= baudrate;
+//		cfg_prt[0].inProtoMask	= in_proto_mask;
+//		cfg_prt[0].outProtoMask	= out_proto_mask;
+//		cfg_prt[1].portID		= UBX_TX_CFG_PRT_PORTID_USB;
+//		cfg_prt[1].mode		= UBX_TX_CFG_PRT_MODE;
+//		cfg_prt[1].baudRate	= baudrate;
+//		cfg_prt[1].inProtoMask	= in_proto_mask;
+//		cfg_prt[1].outProtoMask	= out_proto_mask;
+//
+//		if (!sendMessage(UBX_MSG_CFG_PRT, (uint8_t *)cfg_prt, 2 * sizeof(ubx_payload_tx_cfg_prt_t))) {
+//			continue;
+//		}
+//
+//		if (waitForAck(UBX_MSG_CFG_PRT, UBX_CONFIG_TIMEOUT, false) < 0) {
+//			/* try next baudrate */
+//			continue;
+//		}
+//
+//		/* Send a CFG-PRT message again, this time change the baudrate */
+//		memset(cfg_prt, 0, 2 * sizeof(ubx_payload_tx_cfg_prt_t));
+//		cfg_prt[0].portID		= UBX_TX_CFG_PRT_PORTID;
+//		cfg_prt[0].mode		= UBX_TX_CFG_PRT_MODE;
+//		cfg_prt[0].baudRate	= UBX_TX_CFG_PRT_BAUDRATE;
+//		cfg_prt[0].inProtoMask	= in_proto_mask;
+//		cfg_prt[0].outProtoMask	= out_proto_mask;
+//		cfg_prt[1].portID		= UBX_TX_CFG_PRT_PORTID_USB;
+//		cfg_prt[1].mode		= UBX_TX_CFG_PRT_MODE;
+//		cfg_prt[1].baudRate	= UBX_TX_CFG_PRT_BAUDRATE;
+//		cfg_prt[1].inProtoMask	= in_proto_mask;
+//		cfg_prt[1].outProtoMask	= out_proto_mask;
+//
+//		if (!sendMessage(UBX_MSG_CFG_PRT, (uint8_t *)cfg_prt, 2 * sizeof(ubx_payload_tx_cfg_prt_t))) {
+//			continue;
+//		}
+//
+//		/* no ACK is expected here, but read the buffer anyway in case we actually get an ACK */
+//		waitForAck(UBX_MSG_CFG_PRT, UBX_CONFIG_TIMEOUT, false);
+//
+//		if (UBX_TX_CFG_PRT_BAUDRATE != baudrate) {
+//			setBaudrate(UBX_TX_CFG_PRT_BAUDRATE);
+//			baudrate = UBX_TX_CFG_PRT_BAUDRATE;
+//		}
+//
+//		/* at this point we have correct baudrate on both ends */
+//		break;
+//	}
+//
+//	if (baud_i >= sizeof(baudrates) / sizeof(baudrates[0])) {
+//		return -1;	// connection and/or baudrate detection failed
+//	}
+//
+//	/* Send a CFG-RATE message to define update rate */
+//	memset(&_buf.payload_tx_cfg_rate, 0, sizeof(_buf.payload_tx_cfg_rate));
+//	_buf.payload_tx_cfg_rate.measRate	= UBX_TX_CFG_RATE_MEASINTERVAL;
+//	_buf.payload_tx_cfg_rate.navRate	= UBX_TX_CFG_RATE_NAVRATE;
+//	_buf.payload_tx_cfg_rate.timeRef	= UBX_TX_CFG_RATE_TIMEREF;
+//
+//	if (!sendMessage(UBX_MSG_CFG_RATE, (uint8_t *)&_buf, sizeof(_buf.payload_tx_cfg_rate))) {
+//		return -1;
+//	}
+//
+//	if (waitForAck(UBX_MSG_CFG_RATE, UBX_CONFIG_TIMEOUT, true) < 0) {
+//		return -1;
+//	}
+//
+//	/* send a NAV5 message to set the options for the internal filter */
+//	memset(&_buf.payload_tx_cfg_nav5, 0, sizeof(_buf.payload_tx_cfg_nav5));
+//	_buf.payload_tx_cfg_nav5.mask		= UBX_TX_CFG_NAV5_MASK;
+//	_buf.payload_tx_cfg_nav5.dynModel	= output_mode == OutputMode::GPS ?
+//			UBX_TX_CFG_NAV5_DYNMODEL :
+//			UBX_TX_CFG_NAV5_DYNMODEL_RTCM;
+//	_buf.payload_tx_cfg_nav5.fixMode	= UBX_TX_CFG_NAV5_FIXMODE;
+//
+//	if (!sendMessage(UBX_MSG_CFG_NAV5, (uint8_t *)&_buf, sizeof(_buf.payload_tx_cfg_nav5))) {
+//		return -1;
+//	}
+//
+//	if (waitForAck(UBX_MSG_CFG_NAV5, UBX_CONFIG_TIMEOUT, true) < 0) {
+//		return -1;
+//	}
+//
+//#ifdef UBX_CONFIGURE_SBAS
+//	/* send a SBAS message to set the SBAS options */
+//	memset(&_buf.payload_tx_cfg_sbas, 0, sizeof(_buf.payload_tx_cfg_sbas));
+//	_buf.payload_tx_cfg_sbas.mode		= UBX_TX_CFG_SBAS_MODE;
+//
+//	if (!sendMessage(UBX_MSG_CFG_SBAS, (uint8_t *)&_buf, sizeof(_buf.payload_tx_cfg_sbas))) {
+//		return -1;
+//	}
+//
+//	if (waitForAck(UBX_MSG_CFG_SBAS, UBX_CONFIG_TIMEOUT, true) < 0) {
+//		return -1;
+//	}
+//
+//#endif
+//
+//	/* configure message rates */
+//	/* the last argument is divisor for measurement rate (set by CFG RATE), i.e. 1 means 5Hz */
+//
+//	/* try to set rate for NAV-PVT */
+//	/* (implemented for ubx7+ modules only, use NAV-SOL, NAV-POSLLH, NAV-VELNED and NAV-TIMEUTC for ubx6) */
+//	if (!configureMessageRate(UBX_MSG_NAV_PVT, 1)) {
+//		return -1;
+//	}
+//
+//	if (waitForAck(UBX_MSG_CFG_MSG, UBX_CONFIG_TIMEOUT, true) < 0) {
+//		_use_nav_pvt = false;
+//
+//	} else {
+//		_use_nav_pvt = true;
+//	}
+//
+//	UBX_REC_DEBUG("%susing NAV-PVT", _use_nav_pvt ? "" : "not ");
+//
+//	if (!_use_nav_pvt) {
+//		if (!configureMessageRateAndAck(UBX_MSG_NAV_TIMEUTC, 5, true)) {
+//			return -1;
+//		}
+//
+//		if (!configureMessageRateAndAck(UBX_MSG_NAV_POSLLH, 1, true)) {
+//			return -1;
+//		}
+//
+//		if (!configureMessageRateAndAck(UBX_MSG_NAV_SOL, 1, true)) {
+//			return -1;
+//		}
+//
+//		if (!configureMessageRateAndAck(UBX_MSG_NAV_VELNED, 1, true)) {
+//			return -1;
+//		}
+//	}
+//
+//	if (!configureMessageRateAndAck(UBX_MSG_NAV_DOP, 1, true)) {
+//		return -1;
+//	}
+//
+//	if (!configureMessageRateAndAck(UBX_MSG_NAV_SVINFO, (_satellite_info != nullptr) ? 5 : 0, true)) {
+//		return -1;
+//	}
+//
+//	if (!configureMessageRateAndAck(UBX_MSG_MON_HW, 1, true)) {
+//		return -1;
+//	}
+//
+//	/* request module version information by sending an empty MON-VER message */
+//	if (!sendMessage(UBX_MSG_MON_VER, nullptr, 0)) {
+//		return -1;
+//	}
+//
+//	if (output_mode == OutputMode::RTCM) {
+//		if (restartSurveyIn() < 0) {
+//			return -1;
+//		}
+//	}
+//	
+//	setBaudrate(115200);
+//
+//	_configured = true;
+//	return 0;
+//}
 
-int GPSDriverUBX::restartSurveyIn()
+int GPSDriverUBX_rec::restartSurveyIn()
 {
 	if (_output_mode != OutputMode::RTCM) {
 		return -1;
@@ -342,15 +335,15 @@ int GPSDriverUBX::restartSurveyIn()
 		return -1;
 	}
 
-	UBX_DEBUG("Starting Survey-in");
+	UBX_REC_DEBUG("Starting Survey-in");
 
 	memset(&_buf.payload_tx_cfg_tmode3, 0, sizeof(_buf.payload_tx_cfg_tmode3));
 	_buf.payload_tx_cfg_tmode3.flags        = UBX_TX_CFG_TMODE3_FLAGS;
-	_buf.payload_tx_cfg_tmode3.svinMinDur   = _survey_in_min_dur;
-	_buf.payload_tx_cfg_tmode3.svinAccLimit = _survey_in_acc_limit;
+	_buf.payload_tx_cfg_tmode3.svinMinDur   = UBX_TX_CFG_TMODE3_SVINMINDUR;
+	_buf.payload_tx_cfg_tmode3.svinAccLimit = UBX_TX_CFG_TMODE3_SVINACCLIMIT;
 
 	if (!sendMessage(UBX_MSG_CFG_TMODE3, (uint8_t *)&_buf, sizeof(_buf.payload_tx_cfg_tmode3))) {
-		return -1;
+        return -1;
 	}
 
 	if (waitForAck(UBX_MSG_CFG_TMODE3, UBX_CONFIG_TIMEOUT, true) < 0) {
@@ -366,7 +359,7 @@ int GPSDriverUBX::restartSurveyIn()
 }
 
 int	// -1 = NAK, error or timeout, 0 = ACK
-GPSDriverUBX::waitForAck(const uint16_t msg, const unsigned timeout, const bool report)
+GPSDriverUBX_rec::waitForAck(const uint16_t msg, const unsigned timeout, const bool report)
 {
 	int ret = -1;
 
@@ -377,17 +370,17 @@ GPSDriverUBX::waitForAck(const uint16_t msg, const unsigned timeout, const bool 
 
 	while ((_ack_state == UBX_ACK_WAITING) && (gps_absolute_time() < time_started + timeout * 1000)) {
 		receive(timeout);
-	}
+    }
 
 	if (_ack_state == UBX_ACK_GOT_ACK) {
 		ret = 0;	// ACK received ok
 
 	} else if (report) {
 		if (_ack_state == UBX_ACK_GOT_NAK) {
-			UBX_DEBUG("ubx msg 0x%04x NAK", SWAP16((unsigned)msg));
+			UBX_REC_DEBUG("ubx msg 0x%04x NAK", SWAP16((unsigned)msg));
 
 		} else {
-			UBX_DEBUG("ubx msg 0x%04x ACK timeout", SWAP16((unsigned)msg));
+			UBX_REC_DEBUG("ubx msg 0x%04x ACK timeout", SWAP16((unsigned)msg));
 		}
 	}
 
@@ -396,9 +389,9 @@ GPSDriverUBX::waitForAck(const uint16_t msg, const unsigned timeout, const bool 
 }
 
 int	// -1 = error, 0 = no message handled, 1 = message handled, 2 = sat info message handled
-GPSDriverUBX::receive(unsigned timeout)
+GPSDriverUBX_rec::receive(unsigned timeout)
 {
-	uint8_t buf[GPS_READ_BUFFER_SIZE];
+    uint8_t buf[GPS_READ_BUFFER_SIZE];
 
 	/* timeout additional to poll */
 	gps_abstime time_started = gps_absolute_time();
@@ -406,14 +399,14 @@ GPSDriverUBX::receive(unsigned timeout)
 	int handled = 0;
 
 	while (true) {
-		bool ready_to_return = _configured ? (_got_posllh && _got_velned) : handled;
+		bool ready_to_return = _configured ? (_got_posllh /*&& _got_velned*/) : handled;
 
 		/* Wait for only UBX_PACKET_TIMEOUT if something already received. */
 		int ret = read(buf, sizeof(buf), ready_to_return ? UBX_PACKET_TIMEOUT : timeout);
 
 		if (ret < 0) {
 			/* something went wrong when polling or reading */
-			UBX_WARN("ubx poll_or_read err");
+			UBX_REC_WARN("ubx poll_or_read err");
 			return -1;
 
 		} else if (ret == 0) {
@@ -425,35 +418,25 @@ GPSDriverUBX::receive(unsigned timeout)
 			}
 
 		} else {
-			//UBX_DEBUG("read %d bytes", ret);
+			//UBX_REC_DEBUG("read %d bytes", ret);
 
 			/* pass received bytes to the packet decoder */
 			for (int i = 0; i < ret; i++) {
 				handled |= parseChar(buf[i]);
-				//UBX_DEBUG("parsed %d: 0x%x", i, buf[i]);
-			}
-
-			if (_interface == Interface::SPI) {
-				if (buf[ret - 1] == 0xff) {
-					if (ready_to_return) {
-						_got_posllh = false;
-						_got_velned = false;
-						return handled;
-					}
-				}
+				//UBX_REC_DEBUG("parsed %d: 0x%x", i, buf[i]);
 			}
 		}
 
 		/* abort after timeout if no useful packets received */
 		if (time_started + timeout * 1000 < gps_absolute_time()) {
-			UBX_DEBUG("timed out, returning");
+			UBX_REC_DEBUG("timed out, returning");
 			return -1;
 		}
 	}
 }
 
 int	// 0 = decoding, 1 = message handled, 2 = sat info message handled
-GPSDriverUBX::parseChar(const uint8_t b)
+GPSDriverUBX_rec::parseChar(const uint8_t b)
 {
 	int ret = 0;
 
@@ -462,11 +445,11 @@ GPSDriverUBX::parseChar(const uint8_t b)
 	/* Expecting Sync1 */
 	case UBX_DECODE_SYNC1:
 		if (b == UBX_SYNC1) {	// Sync1 found --> expecting Sync2
-			UBX_TRACE_PARSER("A");
+            UBX_REC_TRACE_PARSER("A");
 			_decode_state = UBX_DECODE_SYNC2;
 
 		} else if (b == RTCM3_PREAMBLE && _rtcm_message) {
-			UBX_TRACE_PARSER("RTCM");
+			UBX_REC_TRACE_PARSER("RTCM");
 			_decode_state = UBX_DECODE_RTCM3;
 			_rtcm_message->buffer[_rtcm_message->pos++] = b;
 		}
@@ -476,7 +459,7 @@ GPSDriverUBX::parseChar(const uint8_t b)
 	/* Expecting Sync2 */
 	case UBX_DECODE_SYNC2:
 		if (b == UBX_SYNC2) {	// Sync2 found --> expecting Class
-			UBX_TRACE_PARSER("B");
+			UBX_REC_TRACE_PARSER("B");
 			_decode_state = UBX_DECODE_CLASS;
 
 		} else {		// Sync1 not followed by Sync2: reset parser
@@ -487,23 +470,24 @@ GPSDriverUBX::parseChar(const uint8_t b)
 
 	/* Expecting Class */
 	case UBX_DECODE_CLASS:
-		UBX_TRACE_PARSER("C");
+		UBX_REC_TRACE_PARSER("C");
 		addByteToChecksum(b);  // checksum is calculated for everything except Sync and Checksum bytes
-		_rx_msg = b;
+        _rx_msg = b;
 		_decode_state = UBX_DECODE_ID;
 		break;
 
 	/* Expecting ID */
 	case UBX_DECODE_ID:
-		UBX_TRACE_PARSER("D");
+		UBX_REC_TRACE_PARSER("D");
 		addByteToChecksum(b);
 		_rx_msg |= b << 8;
+		//UBX_REC_WARN("_rx_msg %d",_rx_msg);
 		_decode_state = UBX_DECODE_LENGTH1;
 		break;
 
 	/* Expecting first length byte */
 	case UBX_DECODE_LENGTH1:
-		UBX_TRACE_PARSER("E");
+		UBX_REC_TRACE_PARSER("E");
 		addByteToChecksum(b);
 		_rx_payload_length = b;
 		_decode_state = UBX_DECODE_LENGTH2;
@@ -511,7 +495,7 @@ GPSDriverUBX::parseChar(const uint8_t b)
 
 	/* Expecting second length byte */
 	case UBX_DECODE_LENGTH2:
-		UBX_TRACE_PARSER("F");
+		UBX_REC_TRACE_PARSER("F");
 		addByteToChecksum(b);
 		_rx_payload_length |= b << 8;	// calculate payload size
 
@@ -527,7 +511,7 @@ GPSDriverUBX::parseChar(const uint8_t b)
 
 	/* Expecting payload */
 	case UBX_DECODE_PAYLOAD:
-		UBX_TRACE_PARSER(".");
+		UBX_REC_TRACE_PARSER(".");
 		addByteToChecksum(b);
 
 		switch (_rx_msg) {
@@ -562,7 +546,7 @@ GPSDriverUBX::parseChar(const uint8_t b)
 	/* Expecting first checksum byte */
 	case UBX_DECODE_CHKSUM1:
 		if (_rx_ck_a != b) {
-			UBX_DEBUG("ubx checksum err");
+			UBX_REC_WARN("ubx checksum err");
 			decodeInit();
 
 		} else {
@@ -574,7 +558,7 @@ GPSDriverUBX::parseChar(const uint8_t b)
 	/* Expecting second checksum byte */
 	case UBX_DECODE_CHKSUM2:
 		if (_rx_ck_b != b) {
-			UBX_DEBUG("ubx checksum err");
+			UBX_REC_WARN("ubx checksum err");
 
 		} else {
 			ret = payloadRxDone();	// finish payload processing
@@ -588,7 +572,7 @@ GPSDriverUBX::parseChar(const uint8_t b)
 
 		if (_rtcm_message->pos == 3) {
 			_rtcm_message->message_length = (((uint16_t)_rtcm_message->buffer[1] & 3) << 8) | (_rtcm_message->buffer[2]);
-			UBX_DEBUG("got RTCM message with length %i", (int)_rtcm_message->message_length);
+			UBX_REC_DEBUG("got RTCM message with length %i", (int)_rtcm_message->message_length);
 
 			if (_rtcm_message->message_length + 6 > _rtcm_message->buffer_len) {
 				uint16_t new_buffer_len = _rtcm_message->message_length + 6;
@@ -619,7 +603,7 @@ GPSDriverUBX::parseChar(const uint8_t b)
  * Start payload rx
  */
 int	// -1 = abort, 0 = continue
-GPSDriverUBX::payloadRxInit()
+GPSDriverUBX_rec::payloadRxInit()
 {
 	int ret = 0;
 
@@ -653,12 +637,14 @@ GPSDriverUBX::payloadRxInit()
 	case UBX_MSG_NAV_POSLLH:
 		if (_rx_payload_length != sizeof(ubx_payload_rx_nav_posllh_t)) {
 			_rx_state = UBX_RXMSG_ERROR_LENGTH;
-
+            UBX_REC_WARN("1");
 		} else if (!_configured) {
+            UBX_REC_WARN("2ignore if not _configured");
 			_rx_state = UBX_RXMSG_IGNORE;        // ignore if not _configured
 
 		} else if (_use_nav_pvt) {
-			_rx_state = UBX_RXMSG_DISABLE;        // disable if using NAV-PVT instead
+            UBX_REC_WARN("3disable if using NAV-PVT instead");
+            _rx_state = UBX_RXMSG_DISABLE;        // disable if using NAV-PVT instead
 		}
 
 		break;
@@ -783,7 +769,7 @@ GPSDriverUBX::payloadRxInit()
 		break;
 
 	case UBX_RXMSG_DISABLE:	// disable unexpected messages
-		UBX_DEBUG("ubx msg 0x%04x len %u unexpected", SWAP16((unsigned)_rx_msg), (unsigned)_rx_payload_length);
+		UBX_REC_DEBUG("ubx msg 0x%04x len %u unexpected", SWAP16((unsigned)_rx_msg), (unsigned)_rx_payload_length);
 
 		{
 			gps_abstime t = gps_absolute_time();
@@ -791,7 +777,7 @@ GPSDriverUBX::payloadRxInit()
 			if (t > _disable_cmd_last + DISABLE_MSG_INTERVAL) {
 				/* don't attempt for every message to disable, some might not be disabled */
 				_disable_cmd_last = t;
-				UBX_DEBUG("ubx disabling msg 0x%04x", SWAP16((unsigned)_rx_msg));
+				UBX_REC_DEBUG("ubx disabling msg 0x%04x", SWAP16((unsigned)_rx_msg));
 
 				if (!configureMessageRate(_rx_msg, 0)) {
 					ret = -1;
@@ -803,12 +789,12 @@ GPSDriverUBX::payloadRxInit()
 		break;
 
 	case UBX_RXMSG_ERROR_LENGTH:	// error: invalid length
-		UBX_WARN("ubx msg 0x%04x invalid len %u", SWAP16((unsigned)_rx_msg), (unsigned)_rx_payload_length);
+		UBX_REC_WARN("ubx msg 0x%04x invalid len %u", SWAP16((unsigned)_rx_msg), (unsigned)_rx_payload_length);
 		ret = -1;	// return error, abort handling this message
 		break;
 
 	default:	// invalid message state
-		UBX_WARN("ubx internal err1");
+		UBX_REC_WARN("ubx internal err1");
 		ret = -1;	// return error, abort handling this message
 		break;
 	}
@@ -820,7 +806,7 @@ GPSDriverUBX::payloadRxInit()
  * Add payload rx byte
  */
 int	// -1 = error, 0 = ok, 1 = payload completed
-GPSDriverUBX::payloadRxAdd(const uint8_t b)
+GPSDriverUBX_rec::payloadRxAdd(const uint8_t b)
 {
 	int ret = 0;
 	uint8_t *p_buf = (uint8_t *)&_buf;
@@ -838,7 +824,7 @@ GPSDriverUBX::payloadRxAdd(const uint8_t b)
  * Add NAV-SVINFO payload rx byte
  */
 int	// -1 = error, 0 = ok, 1 = payload completed
-GPSDriverUBX::payloadRxAddNavSvinfo(const uint8_t b)
+GPSDriverUBX_rec::payloadRxAddNavSvinfo(const uint8_t b)
 {
 	int ret = 0;
 	uint8_t *p_buf = (uint8_t *)&_buf;
@@ -851,7 +837,7 @@ GPSDriverUBX::payloadRxAddNavSvinfo(const uint8_t b)
 		if (_rx_payload_index == sizeof(ubx_payload_rx_nav_svinfo_part1_t)) {
 			// Part 1 complete: decode Part 1 buffer
 			_satellite_info->count = MIN(_buf.payload_rx_nav_svinfo_part1.numCh, satellite_info_s::SAT_INFO_MAX_SATELLITES);
-			UBX_TRACE_SVINFO("SVINFO len %u  numCh %u", (unsigned)_rx_payload_length,
+			UBX_REC_TRACE_SVINFO("SVINFO len %u  numCh %u", (unsigned)_rx_payload_length,
 					 (unsigned)_buf.payload_rx_nav_svinfo_part1.numCh);
 		}
 
@@ -871,7 +857,7 @@ GPSDriverUBX::payloadRxAddNavSvinfo(const uint8_t b)
 				_satellite_info->elevation[sat_index]	= (uint8_t)(_buf.payload_rx_nav_svinfo_part2.elev);
 				_satellite_info->azimuth[sat_index]	= (uint8_t)((float)_buf.payload_rx_nav_svinfo_part2.azim * 255.0f / 360.0f);
 				_satellite_info->svid[sat_index]	= (uint8_t)(_buf.payload_rx_nav_svinfo_part2.svid);
-				UBX_TRACE_SVINFO("SVINFO #%02u  used %u  snr %3u  elevation %3u  azimuth %3u  svid %3u",
+				UBX_REC_TRACE_SVINFO("SVINFO #%02u  used %u  snr %3u  elevation %3u  azimuth %3u  svid %3u",
 						 (unsigned)sat_index + 1,
 						 (unsigned)_satellite_info->used[sat_index],
 						 (unsigned)_satellite_info->snr[sat_index],
@@ -894,7 +880,7 @@ GPSDriverUBX::payloadRxAddNavSvinfo(const uint8_t b)
  * Add MON-VER payload rx byte
  */
 int	// -1 = error, 0 = ok, 1 = payload completed
-GPSDriverUBX::payloadRxAddMonVer(const uint8_t b)
+GPSDriverUBX_rec::payloadRxAddMonVer(const uint8_t b)
 {
 	int ret = 0;
 	uint8_t *p_buf = (uint8_t *)&_buf;
@@ -908,9 +894,9 @@ GPSDriverUBX::payloadRxAddMonVer(const uint8_t b)
 			// Part 1 complete: decode Part 1 buffer and calculate hash for SW&HW version strings
 			_ubx_version = fnv1_32_str(_buf.payload_rx_mon_ver_part1.swVersion, FNV1_32_INIT);
 			_ubx_version = fnv1_32_str(_buf.payload_rx_mon_ver_part1.hwVersion, _ubx_version);
-			UBX_DEBUG("VER hash 0x%08x", _ubx_version);
-			UBX_DEBUG("VER hw  \"%10s\"", _buf.payload_rx_mon_ver_part1.hwVersion);
-			UBX_DEBUG("VER sw  \"%30s\"", _buf.payload_rx_mon_ver_part1.swVersion);
+			UBX_REC_DEBUG("VER hash 0x%08x", _ubx_version);
+			UBX_REC_DEBUG("VER hw  \"%10s\"", _buf.payload_rx_mon_ver_part1.hwVersion);
+			UBX_REC_DEBUG("VER sw  \"%30s\"", _buf.payload_rx_mon_ver_part1.swVersion);
 		}
 
 		// fill Part 2 buffer
@@ -920,7 +906,7 @@ GPSDriverUBX::payloadRxAddMonVer(const uint8_t b)
 
 		if (buf_index == sizeof(ubx_payload_rx_mon_ver_part2_t) - 1) {
 			// Part 2 complete: decode Part 2 buffer
-			UBX_DEBUG("VER ext \" %30s\"", _buf.payload_rx_mon_ver_part2.extension);
+			UBX_REC_DEBUG("VER ext \" %30s\"", _buf.payload_rx_mon_ver_part2.extension);
 		}
 	}
 
@@ -931,13 +917,14 @@ GPSDriverUBX::payloadRxAddMonVer(const uint8_t b)
 	return ret;
 }
 
-/**x
+/**
  * Finish payload rx
  */
 int	// 0 = no message handled, 1 = message handled, 2 = sat info message handled
-GPSDriverUBX::payloadRxDone()
+GPSDriverUBX_rec::payloadRxDone(void)
 {
 	int ret = 0;
+	static uint32_t itow_now = 0;
 
 	// return if no message handled
 	if (_rx_state != UBX_RXMSG_HANDLE) {
@@ -948,8 +935,8 @@ GPSDriverUBX::payloadRxDone()
 	switch (_rx_msg) {
 
 	case UBX_MSG_NAV_PVT:
-		UBX_TRACE_RXMSG("Rx NAV-PVT");
-
+		UBX_REC_TRACE_RXID("Rx NAV-PVT");
+        PX4_INFO("used PVT");
 		//Check if position fix flag is good
 		if ((_buf.payload_rx_nav_pvt.flags & UBX_RX_NAV_PVT_FLAGS_GNSSFIXOK) == 1) {
 			_gps_position->fix_type		 = _buf.payload_rx_nav_pvt.fixType;
@@ -961,7 +948,7 @@ GPSDriverUBX::payloadRxDone()
 			uint8_t carr_soln = _buf.payload_rx_nav_pvt.flags >> 6;
 
 			if (carr_soln == 1) {
-				_gps_position->fix_type = 5; //Float RTK
+                _gps_position->fix_type = 5; //Float RTK
 
 			} else if (carr_soln == 2) {
 				_gps_position->fix_type = 6; //Fixed RTK
@@ -979,7 +966,6 @@ GPSDriverUBX::payloadRxDone()
 		_gps_position->lat		= _buf.payload_rx_nav_pvt.lat;
 		_gps_position->lon		= _buf.payload_rx_nav_pvt.lon;
 		_gps_position->alt		= _buf.payload_rx_nav_pvt.hMSL;
-		_gps_position->alt_ellipsoid	= _buf.payload_rx_nav_pvt.height;
 
 		_gps_position->eph		= (float)_buf.payload_rx_nav_pvt.hAcc * 1e-3f;
 		_gps_position->epv		= (float)_buf.payload_rx_nav_pvt.vAcc * 1e-3f;
@@ -993,6 +979,7 @@ GPSDriverUBX::payloadRxDone()
 
 		_gps_position->cog_rad		= (float)_buf.payload_rx_nav_pvt.headMot * M_DEG_TO_RAD_F * 1e-5f;
 		_gps_position->c_variance_rad	= (float)_buf.payload_rx_nav_pvt.headAcc * M_DEG_TO_RAD_F * 1e-5f;
+//		_gps_position->pos_itow		= _buf.payload_rx_nav_pvt.iTOW;
 
 		//Check if time and date fix flags are good
 		if ((_buf.payload_rx_nav_pvt.valid & UBX_RX_NAV_PVT_VALID_VALIDDATE)
@@ -1000,7 +987,6 @@ GPSDriverUBX::payloadRxDone()
 		    && (_buf.payload_rx_nav_pvt.valid & UBX_RX_NAV_PVT_VALID_FULLYRESOLVED)) {
 			/* convert to unix timestamp */
 			struct tm timeinfo;
-			memset(&timeinfo, 0, sizeof(timeinfo));
 			timeinfo.tm_year	= _buf.payload_rx_nav_pvt.year - 1900;
 			timeinfo.tm_mon		= _buf.payload_rx_nav_pvt.month - 1;
 			timeinfo.tm_mday	= _buf.payload_rx_nav_pvt.day;
@@ -1017,16 +1003,15 @@ GPSDriverUBX::payloadRxDone()
 				// clock, updating it from time to time is safe.
 
 				timespec ts;
-				memset(&ts, 0, sizeof(ts));
 				ts.tv_sec = epoch;
 				ts.tv_nsec = _buf.payload_rx_nav_pvt.nano;
 
 				setClock(ts);
 
 				_gps_position->time_utc_usec = static_cast<uint64_t>(epoch) * 1000000ULL;
-				_gps_position->time_utc_usec += _buf.payload_rx_nav_pvt.nano / 1000;
+				_gps_position->time_utc_usec += _buf.payload_rx_nav_timeutc.nano / 1000;
 
-			} else {
+            } else {
 				_gps_position->time_utc_usec = 0;
 			}
 
@@ -1048,10 +1033,10 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_INF_DEBUG:
-	case UBX_MSG_INF_NOTICE: {
+    case UBX_MSG_INF_NOTICE: {
 			uint8_t *p_buf = (uint8_t *)&_buf;
 			p_buf[_rx_payload_length] = 0;
-			UBX_DEBUG("ubx msg: %s", p_buf);
+			UBX_REC_DEBUG("ubx msg: %s", p_buf);
 		}
 		break;
 
@@ -1059,20 +1044,26 @@ GPSDriverUBX::payloadRxDone()
 	case UBX_MSG_INF_WARNING: {
 			uint8_t *p_buf = (uint8_t *)&_buf;
 			p_buf[_rx_payload_length] = 0;
-			UBX_WARN("ubx msg: %s", p_buf);
+			UBX_REC_WARN("ubx msg: %s", p_buf);
 		}
 		break;
 
 	case UBX_MSG_NAV_POSLLH:
-		UBX_TRACE_RXMSG("Rx NAV-POSLLH");
+		UBX_REC_TRACE_RXID("Rx NAV-POSLLH");
 
-		_gps_position->lat	= _buf.payload_rx_nav_posllh.lat;
-		_gps_position->lon	= _buf.payload_rx_nav_posllh.lon;
-		_gps_position->alt	= _buf.payload_rx_nav_posllh.hMSL;
+//        _gps_position->lat	= _buf.payload_rx_nav_posllh.lat*1e3;
+//		_gps_position->lon	= _buf.payload_rx_nav_posllh.lon*1e3;
+//		_gps_position->alt	= _buf.payload_rx_nav_posllh.hMSL*1e2;
+        _gps_position->lat	= _buf.payload_rx_nav_posllh.lat;
+        _gps_position->lon	= _buf.payload_rx_nav_posllh.lon;
+        _gps_position->alt	= _buf.payload_rx_nav_posllh.hMSL;
 		_gps_position->eph	= (float)_buf.payload_rx_nav_posllh.hAcc * 1e-3f; // from mm to m
 		_gps_position->epv	= (float)_buf.payload_rx_nav_posllh.vAcc * 1e-3f; // from mm to m
 		_gps_position->alt_ellipsoid = _buf.payload_rx_nav_posllh.height;
+        //_gps_position-> = _buf.payload_rx_nav_posllh.iTOW;
 
+        itow_now = _buf.payload_rx_nav_posllh.iTOW;
+        //PX4_INFO("lat:%f,lon:%f,HMSL:%f",_buf.payload_rx_nav_posllh.lat,_buf.payload_rx_nav_posllh.lon,_buf.payload_rx_nav_posllh.hMSL);
 		_gps_position->timestamp = gps_absolute_time();
 
 		_rate_count_lat_lon++;
@@ -1082,9 +1073,26 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_NAV_SOL:
-		UBX_TRACE_RXMSG("Rx NAV-SOL");
+		UBX_REC_TRACE_RXID("Rx NAV-SOL");
+        PX4_INFO("gps:flags:%d",_buf.payload_rx_nav_sol.flags);
+        switch(_buf.payload_rx_nav_sol.flags)
+        {
+            case 12:
+                _gps_position->fix_type=3;
+                break;
+            case 13:
+                _gps_position->fix_type=5;
+                break;
+            case 15:
+                _gps_position->fix_type=6;
+                break;
+            default:
+                break;
 
-		_gps_position->fix_type		= _buf.payload_rx_nav_sol.gpsFix;
+        }
+//		_gps_position->fix_type		= _buf.payload_rx_nav_sol.gpsFix;
+//		_gps_position->status0		= _buf.payload_rx_nav_sol.flags;
+//		_gps_position->status1		= _buf.payload_rx_nav_sol.flags;//LLQ:20170725
 		_gps_position->s_variance_m_s	= (float)_buf.payload_rx_nav_sol.sAcc * 1e-2f;	// from cm to m
 		_gps_position->satellites_used	= _buf.payload_rx_nav_sol.numSV;
 
@@ -1092,7 +1100,7 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_NAV_DOP:
-		UBX_TRACE_RXMSG("Rx NAV-DOP");
+		UBX_REC_TRACE_RXID("Rx NAV-DOP");
 
 		_gps_position->hdop		= _buf.payload_rx_nav_dop.hDOP * 0.01f;	// from cm to m
 		_gps_position->vdop		= _buf.payload_rx_nav_dop.vDOP * 0.01f;	// from cm to m
@@ -1101,19 +1109,17 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_NAV_TIMEUTC:
-		UBX_TRACE_RXMSG("Rx NAV-TIMEUTC");
+		UBX_REC_TRACE_RXID("Rx NAV-TIMEUTC");
 
 		if (_buf.payload_rx_nav_timeutc.valid & UBX_RX_NAV_TIMEUTC_VALID_VALIDUTC) {
 			// convert to unix timestamp
 			struct tm timeinfo;
-			memset(&timeinfo, 0, sizeof(tm));
 			timeinfo.tm_year	= _buf.payload_rx_nav_timeutc.year - 1900;
 			timeinfo.tm_mon		= _buf.payload_rx_nav_timeutc.month - 1;
 			timeinfo.tm_mday	= _buf.payload_rx_nav_timeutc.day;
 			timeinfo.tm_hour	= _buf.payload_rx_nav_timeutc.hour;
 			timeinfo.tm_min		= _buf.payload_rx_nav_timeutc.min;
 			timeinfo.tm_sec		= _buf.payload_rx_nav_timeutc.sec;
-			timeinfo.tm_isdst	= 0;
 #ifndef NO_MKTIME
 			time_t epoch = mktime(&timeinfo);
 
@@ -1125,7 +1131,6 @@ GPSDriverUBX::payloadRxDone()
 				// clock, updating it from time to time is safe.
 
 				timespec ts;
-				memset(&ts, 0, sizeof(ts));
 				ts.tv_sec = epoch;
 				ts.tv_nsec = _buf.payload_rx_nav_timeutc.nano;
 
@@ -1149,7 +1154,7 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_NAV_SVINFO:
-		UBX_TRACE_RXMSG("Rx NAV-SVINFO");
+		UBX_REC_TRACE_RXID("Rx NAV-SVINFO");
 
 		// _satellite_info already populated by payload_rx_add_svinfo(), just add a timestamp
 		_satellite_info->timestamp = gps_absolute_time();
@@ -1158,15 +1163,14 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_NAV_SVIN:
-		UBX_TRACE_RXMSG("Rx NAV-SVIN");
+		UBX_REC_TRACE_RXID("Rx NAV-SVIN");
 		{
 			ubx_payload_rx_nav_svin_t &svin = _buf.payload_rx_nav_svin;
 
-			UBX_DEBUG("Survey-in status: %is cur accuracy: %imm nr obs: %i valid: %i active: %i",
+			UBX_REC_DEBUG("Survey-in status: %is cur accuracy: %imm nr obs: %i valid: %i active: %i",
 				  svin.dur, svin.meanAcc / 10, svin.obs, (int)svin.valid, (int)svin.active);
 
 			SurveyInStatus status;
-			memset(&status, 0, sizeof(status));
 			status.duration = svin.dur;
 			status.mean_accuracy = svin.meanAcc / 10;
 			status.flags = (svin.valid & 1) | ((svin.active & 1) << 1);
@@ -1211,7 +1215,7 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_NAV_VELNED:
-		UBX_TRACE_RXMSG("Rx NAV-VELNED");
+		UBX_REC_TRACE_RXID("Rx NAV-VELNED");
 
 		_gps_position->vel_m_s		= (float)_buf.payload_rx_nav_velned.speed * 1e-2f;
 		_gps_position->vel_n_m_s	= (float)_buf.payload_rx_nav_velned.velN * 1e-2f; /* NED NORTH velocity */
@@ -1219,8 +1223,14 @@ GPSDriverUBX::payloadRxDone()
 		_gps_position->vel_d_m_s	= (float)_buf.payload_rx_nav_velned.velD * 1e-2f; /* NED DOWN velocity */
 		_gps_position->cog_rad		= (float)_buf.payload_rx_nav_velned.heading * M_DEG_TO_RAD_F * 1e-5f;
 		_gps_position->c_variance_rad	= (float)_buf.payload_rx_nav_velned.cAcc * M_DEG_TO_RAD_F * 1e-5f;
-		_gps_position->vel_ned_valid	= true;
-
+//		_gps_position->sAcc				= _buf.payload_rx_nav_velned.sAcc;
+		//_gps_position->vel_ned_valid	= true;
+		if(_buf.payload_rx_nav_velned.iTOW != itow_now){
+			_gps_position->vel_ned_valid = false;
+		} else {
+			_gps_position->vel_ned_valid = true;
+		}
+		
 		_rate_count_vel++;
 		_got_velned = true;
 
@@ -1228,13 +1238,13 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_MON_VER:
-		UBX_TRACE_RXMSG("Rx MON-VER");
+		UBX_REC_TRACE_RXID("Rx MON-VER");
 
 		ret = 1;
 		break;
 
 	case UBX_MSG_MON_HW:
-		UBX_TRACE_RXMSG("Rx MON-HW");
+		UBX_REC_TRACE_RXID("Rx MON-HW");
 
 		switch (_rx_payload_length) {
 
@@ -1260,7 +1270,7 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_ACK_ACK:
-		UBX_TRACE_RXMSG("Rx ACK-ACK");
+		UBX_REC_TRACE_RXID("Rx ACK-ACK");
 
 		if ((_ack_state == UBX_ACK_WAITING) && (_buf.payload_rx_ack_ack.msg == _ack_waiting_msg)) {
 			_ack_state = UBX_ACK_GOT_ACK;
@@ -1270,7 +1280,7 @@ GPSDriverUBX::payloadRxDone()
 		break;
 
 	case UBX_MSG_ACK_NAK:
-		UBX_TRACE_RXMSG("Rx ACK-NAK");
+		UBX_REC_TRACE_RXID("Rx ACK-NAK");
 
 		if ((_ack_state == UBX_ACK_WAITING) && (_buf.payload_rx_ack_ack.msg == _ack_waiting_msg)) {
 			_ack_state = UBX_ACK_GOT_NAK;
@@ -1287,11 +1297,13 @@ GPSDriverUBX::payloadRxDone()
 		_gps_position->timestamp_time_relative = (int32_t)(_last_timestamp_time - _gps_position->timestamp);
 	}
 
-	return ret;
+	print_info();
+    PX4_INFO("lat:%ld,lon:%ld,alt:%ld",(_gps_position->lat),(_gps_position->lon),(_gps_position->alt));
+    return ret;
 }
 
 void
-GPSDriverUBX::decodeInit()
+GPSDriverUBX_rec::decodeInit(void)
 {
 	_decode_state = UBX_DECODE_SYNC1;
 	_rx_ck_a = 0;
@@ -1312,14 +1324,14 @@ GPSDriverUBX::decodeInit()
 }
 
 void
-GPSDriverUBX::addByteToChecksum(const uint8_t b)
+GPSDriverUBX_rec::addByteToChecksum(const uint8_t b)
 {
 	_rx_ck_a = _rx_ck_a + b;
 	_rx_ck_b = _rx_ck_b + _rx_ck_a;
 }
 
 void
-GPSDriverUBX::calcChecksum(const uint8_t *buffer, const uint16_t length, ubx_checksum_t *checksum)
+GPSDriverUBX_rec::calcChecksum(const uint8_t *buffer, const uint16_t length, ubx_checksum_t *checksum)
 {
 	for (uint16_t i = 0; i < length; i++) {
 		checksum->ck_a = checksum->ck_a + buffer[i];
@@ -1328,10 +1340,9 @@ GPSDriverUBX::calcChecksum(const uint8_t *buffer, const uint16_t length, ubx_che
 }
 
 bool
-GPSDriverUBX::configureMessageRate(const uint16_t msg, const uint8_t rate)
+GPSDriverUBX_rec::configureMessageRate(const uint16_t msg, const uint8_t rate)
 {
 	ubx_payload_tx_cfg_msg_t cfg_msg;	// don't use _buf (allow interleaved operation)
-	memset(&cfg_msg, 0, sizeof(cfg_msg));
 
 	cfg_msg.msg	= msg;
 	cfg_msg.rate	= rate;
@@ -1340,7 +1351,7 @@ GPSDriverUBX::configureMessageRate(const uint16_t msg, const uint8_t rate)
 }
 
 bool
-GPSDriverUBX::configureMessageRateAndAck(uint16_t msg, uint8_t rate, bool report_ack_error)
+GPSDriverUBX_rec::configureMessageRateAndAck(uint16_t msg, uint8_t rate, bool report_ack_error)
 {
 	if (!configureMessageRate(msg, rate)) {
 		return false;
@@ -1350,7 +1361,7 @@ GPSDriverUBX::configureMessageRateAndAck(uint16_t msg, uint8_t rate, bool report
 }
 
 bool
-GPSDriverUBX::sendMessage(const uint16_t msg, const uint8_t *payload, const uint16_t length)
+GPSDriverUBX_rec::sendMessage(const uint16_t msg, const uint8_t *payload, const uint16_t length)
 {
 	ubx_header_t   header = {UBX_SYNC1, UBX_SYNC2, 0, 0};
 	ubx_checksum_t checksum = {0, 0};
@@ -1383,7 +1394,7 @@ GPSDriverUBX::sendMessage(const uint16_t msg, const uint8_t *payload, const uint
 }
 
 uint32_t
-GPSDriverUBX::fnv1_32_str(uint8_t *str, uint32_t hval)
+GPSDriverUBX_rec::fnv1_32_str(uint8_t *str, uint32_t hval)
 {
 	uint8_t *s = str;
 
@@ -1407,10 +1418,81 @@ GPSDriverUBX::fnv1_32_str(uint8_t *str, uint32_t hval)
 	return hval;
 }
 
+/**
+ * print rx data
+ */
 void
-GPSDriverUBX::setSurveyInSpecs(uint32_t survey_in_acc_limit, uint32_t survey_in_min_dur)
+GPSDriverUBX_rec::print_info(void)
 {
-	_survey_in_acc_limit = survey_in_acc_limit;
-	_survey_in_min_dur = survey_in_min_dur;
+	//NOVATEL_TRACE_RXMSG("basic info:sz double:%d, sz sig:%d", 
+	//					sizeof(_buf.payload.payload_rx_alignbslnenu.east),
+	//					sizeof(_buf.payload.payload_rx_alignbslnenu.east_sig));
+
+//	NOVATEL_TRACE_RXMSG("head info:frame id:%d, frame len:%d", 
+//						_buf.frmhead.msg_id, _buf.frmhead.msg_len);
+//	NOVATEL_TRACE_RXMSG("payload info:sol:%d, pos:%d", 
+//						_buf.payload.payload_rx_alignbslnenu.sol_stat,
+//						_buf.payload.payload_rx_alignbslnenu.pos_type);
+	static bool nav_pvt=false;
+	static bool nav_sol=false;
+	static bool nav_velned=false;
+	static bool nav_posllh=false;
+
+	static uint32_t cnt = 0;
+	//if(_buf.frmhead.msg_id == NOVATEL_ID_RTKXYZ){
+	if(cnt++ % 2000 == 0){	
+		nav_pvt=true;
+		nav_sol=true;
+		nav_velned=true;
+		nav_posllh=true;
+	}
+
+	if(nav_pvt && _rx_msg == UBX_MSG_NAV_PVT){
+		UBX_REC_TRACE_RXMSG("NAV-PVT info:lat:%d", 
+							_buf.payload_rx_nav_pvt.lat);//z
+		nav_pvt = false;
+	}
+
+	if(nav_sol && _rx_msg == UBX_MSG_NAV_SOL){
+		UBX_REC_TRACE_RXMSG("NAV-SOL info:flag:%u", 
+							_buf.payload_rx_nav_sol.flags & 0xff);//z
+		nav_sol = false;
+	}
+
+	
+	if(nav_velned && _rx_msg == UBX_MSG_NAV_VELNED){
+		UBX_REC_TRACE_RXMSG("NAV-VELNED info, sAcc:%u, heading:%d", 
+							_buf.payload_rx_nav_velned.sAcc,
+							_buf.payload_rx_nav_velned.heading);//z
+		nav_velned = false;
+	}
+
+	if(nav_posllh && _rx_msg == UBX_MSG_NAV_POSLLH){
+		UBX_REC_TRACE_RXMSG("NAV-POSLLH info");//z
+		nav_posllh = false;
+	}
+    //static int cnt = 0;
+    //if(cnt++ == 0){
+    UBX_REC_TRACE_RXMSG("msg id:%x", _rx_msg);
+    //UBX_REC_TRACE_RXMSG("RTK2llh info:fix_t:%d, flag:%d, lon:%lld, lat:%lld, alt:%lld; vn:%.9f, ve:%.9f, vd:%.9f",
+    /*PX4_INFO("RTK2llh info:fix_t:%d, lon:%lld, lat:%lld, alt:%lld; cor %.9f, ori_yaw %d",
+                        (_gps_position->fix_type & 0xff),
+
+                        (_gps_position->lon), //x
+                        (_gps_position->lat),//y
+                        (_gps_position->alt),
+                        //(double)(_gps_position->vel_n_m_s),
+                        //(double)(_gps_position->vel_e_m_s),
+                        //(double)(_gps_position->vel_d_m_s),
+                        (double)(_gps_position->cog_rad),
+                        _buf.payload_rx_nav_velned.heading);//z*/
+    /*UBX_REC_TRACE_RXMSG("msg id:%d, statu:%d, RTK:X:%.9f, Y:%.9f, Z:%.9f",
+                            _buf.frmhead.msg_id,
+                            _buf.payload.payload_rx_rtkxyz.psol_stat,
+                            _buf.payload.payload_rx_rtkxyz.P_X,
+                            _buf.payload.payload_rx_rtkxyz.P_Y,
+                            _buf.payload.payload_rx_rtkxyz.P_Z
+                            );*/
+    //}
 }
 
