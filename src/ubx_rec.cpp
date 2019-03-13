@@ -827,25 +827,25 @@ int	// -1 = error, 0 = ok, 1 = payload completed
 GPSDriverUBX_rec::payloadRxAddNavSvinfo(const uint8_t b)
 {
 	int ret = 0;
-	uint8_t *p_buf = (uint8_t *)&_buf;
+    uint8_t *p_buf = (uint8_t *)&_buf;//为什么需要使用这个（uint8_t是char）这个对p_buf的操作可以存贮在_buf中
 
-	if (_rx_payload_index < sizeof(ubx_payload_rx_nav_svinfo_part1_t)) {
+    if (_rx_payload_index < sizeof(ubx_payload_rx_nav_svinfo_part1_t)) {//_rx_payload_index在decodeinit中赋值
 		// Fill Part 1 buffer
-		p_buf[_rx_payload_index] = b;
+        p_buf[_rx_payload_index] = b;//_buf中那么多内容直接放是可以的嘛？？？先放svinfo_part1的信息
 
 	} else {
-		if (_rx_payload_index == sizeof(ubx_payload_rx_nav_svinfo_part1_t)) {
-			// Part 1 complete: decode Part 1 buffer
-			_satellite_info->count = MIN(_buf.payload_rx_nav_svinfo_part1.numCh, satellite_info_s::SAT_INFO_MAX_SATELLITES);
+        if (_rx_payload_index == sizeof(ubx_payload_rx_nav_svinfo_part1_t)) {
+            // Part 1 complete: decode Part 1 buffer part1只解一个count
+            _satellite_info->count = MIN(_buf.payload_rx_nav_svinfo_part1.numCh, satellite_info_s::SAT_INFO_MAX_SATELLITES);
 			UBX_REC_TRACE_SVINFO("SVINFO len %u  numCh %u", (unsigned)_rx_payload_length,
 					 (unsigned)_buf.payload_rx_nav_svinfo_part1.numCh);
 		}
 
 		if (_rx_payload_index < sizeof(ubx_payload_rx_nav_svinfo_part1_t) + _satellite_info->count * sizeof(
-			    ubx_payload_rx_nav_svinfo_part2_t)) {
+                ubx_payload_rx_nav_svinfo_part2_t)) {//可能 numCH means frequency
 			// Still room in _satellite_info: fill Part 2 buffer
 			unsigned buf_index = (_rx_payload_index - sizeof(ubx_payload_rx_nav_svinfo_part1_t)) % sizeof(
-						     ubx_payload_rx_nav_svinfo_part2_t);
+                             ubx_payload_rx_nav_svinfo_part2_t);
 			p_buf[buf_index] = b;
 
 			if (buf_index == sizeof(ubx_payload_rx_nav_svinfo_part2_t) - 1) {
