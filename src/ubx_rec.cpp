@@ -71,7 +71,7 @@
 /**** Trace macros, disable for production builds */
 #define UBX_REC_TRACE_PARSER(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* decoding progress in parse_char() */
 #define UBX_REC_TRACE_RXMSG(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* Rx msgs in payload_rx_done() */
-#define UBX_REC_TRACE_SVINFO(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
+#define UBX_REC_TRACE_SVINFO(...)	{GPS_INFO(__VA_ARGS__);}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
 #define UBX_REC_TRACE_RXID(...)		{/*GPS_INFO(__VA_ARGS__);*/}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
 
 /**** Warning macros, disable to save memory */
@@ -423,7 +423,7 @@ GPSDriverUBX_rec::receive(unsigned timeout)
 			/* pass received bytes to the packet decoder */
 			for (int i = 0; i < ret; i++) {
 				handled |= parseChar(buf[i]);
-				//UBX_REC_DEBUG("parsed %d: 0x%x", i, buf[i]);
+                UBX_REC_DEBUG("parsed %d: 0x%x", i, buf[i]);
 			}
 		}
 
@@ -515,6 +515,7 @@ GPSDriverUBX_rec::parseChar(const uint8_t b)
 		addByteToChecksum(b);
 
 		switch (_rx_msg) {
+
 		case UBX_MSG_NAV_SVINFO:
 			ret = payloadRxAddNavSvinfo(b);	// add a NAV-SVINFO payload byte
 			break;
@@ -1060,10 +1061,11 @@ GPSDriverUBX_rec::payloadRxDone(void)
 		_gps_position->eph	= (float)_buf.payload_rx_nav_posllh.hAcc * 1e-3f; // from mm to m
 		_gps_position->epv	= (float)_buf.payload_rx_nav_posllh.vAcc * 1e-3f; // from mm to m
 		_gps_position->alt_ellipsoid = _buf.payload_rx_nav_posllh.height;
-        //_gps_position-> = _buf.payload_rx_nav_posllh.iTOW;
+        _gps_position->pos_itow= _buf.payload_rx_nav_posllh.iTOW;
 
         itow_now = _buf.payload_rx_nav_posllh.iTOW;
-        //PX4_INFO("lat:%f,lon:%f,HMSL:%f",_buf.payload_rx_nav_posllh.lat,_buf.payload_rx_nav_posllh.lon,_buf.payload_rx_nav_posllh.hMSL);
+        //by sjj
+        PX4_INFO("itow%lld,lat:%ld,lon:%ld,HMSL:%ld",_buf.payload_rx_nav_posllh.lat,_buf.payload_rx_nav_posllh.lon,_buf.payload_rx_nav_posllh.hMSL);
 		_gps_position->timestamp = gps_absolute_time();
 
 		_rate_count_lat_lon++;
@@ -1074,7 +1076,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 
 	case UBX_MSG_NAV_SOL:
 		UBX_REC_TRACE_RXID("Rx NAV-SOL");
-        PX4_INFO("gps:flags:%d",_buf.payload_rx_nav_sol.flags);
+        //PX4_INFO("gps:flags:%d",_buf.payload_rx_nav_sol.flags);
         switch(_buf.payload_rx_nav_sol.flags)
         {
             case 12:
@@ -1223,8 +1225,8 @@ GPSDriverUBX_rec::payloadRxDone(void)
 		_gps_position->vel_d_m_s	= (float)_buf.payload_rx_nav_velned.velD * 1e-2f; /* NED DOWN velocity */
 		_gps_position->cog_rad		= (float)_buf.payload_rx_nav_velned.heading * M_DEG_TO_RAD_F * 1e-5f;
 		_gps_position->c_variance_rad	= (float)_buf.payload_rx_nav_velned.cAcc * M_DEG_TO_RAD_F * 1e-5f;
-//		_gps_position->sAcc				= _buf.payload_rx_nav_velned.sAcc;
-		//_gps_position->vel_ned_valid	= true;
+        _gps_position->sAcc				= _buf.payload_rx_nav_velned.sAcc;
+        _gps_position->vel_ned_valid	= true;
 		if(_buf.payload_rx_nav_velned.iTOW != itow_now){
 			_gps_position->vel_ned_valid = false;
 		} else {
@@ -1233,6 +1235,15 @@ GPSDriverUBX_rec::payloadRxDone(void)
 		
 		_rate_count_vel++;
 		_got_velned = true;
+        //by sjj print data
+        PX4_INFO("Rx NAV-VELNED,vel_m_s:%5.4f,vel_n_m_s:%5.4f,vel_e_m_s:%5.4f,vel_d_m_s:%5.4f,cog_rad:%5.4f,sAcc%ld,vel_ned_valid:%ld",
+                 (double)_gps_position->vel_m_s,
+                 (double)_gps_position->vel_n_m_s,
+                 (double)_gps_position->vel_e_m_s,
+                 (double)_gps_position->vel_d_m_s,
+                 (double)(_gps_position->cog_rad/M_DEG_TO_RAD_F),
+                 _gps_position->sAcc,
+                 _gps_position->vel_ned_valid);
 
 		ret = 1;
 		break;
@@ -1298,7 +1309,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 	}
 
 	print_info();
-    PX4_INFO("lat:%ld,lon:%ld,alt:%ld",(_gps_position->lat),(_gps_position->lon),(_gps_position->alt));
+    //PX4_INFO("lat:%ld,lon:%ld,alt:%ld",(_gps_position->lat),(_gps_position->lon),(_gps_position->alt));
     return ret;
 }
 
