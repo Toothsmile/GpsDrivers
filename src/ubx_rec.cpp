@@ -1065,7 +1065,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 
         itow_now = _buf.payload_rx_nav_posllh.iTOW;
         //by sjj
-        PX4_INFO("itow%lld,lat:%ld,lon:%ld,HMSL:%ld",_buf.payload_rx_nav_posllh.lat,_buf.payload_rx_nav_posllh.lon,_buf.payload_rx_nav_posllh.hMSL);
+        PX4_INFO("itow%lld,lat:%ld,lon:%ld,HMSL:%ld",_buf.payload_rx_nav_posllh.iTOW,_buf.payload_rx_nav_posllh.lat,_buf.payload_rx_nav_posllh.lon,_buf.payload_rx_nav_posllh.hMSL);
 		_gps_position->timestamp = gps_absolute_time();
 
 		_rate_count_lat_lon++;
@@ -1076,7 +1076,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 
 	case UBX_MSG_NAV_SOL:
 		UBX_REC_TRACE_RXID("Rx NAV-SOL");
-        //PX4_INFO("gps:flags:%d",_buf.payload_rx_nav_sol.flags);
+        PX4_INFO("gps:flags:%d",_buf.payload_rx_nav_sol.flags);// by sjj
         switch(_buf.payload_rx_nav_sol.flags)
         {
             case 12:
