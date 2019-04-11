@@ -71,8 +71,8 @@
 /**** Trace macros, disable for production builds */
 #define UBX_REC_TRACE_PARSER(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* decoding progress in parse_char() */
 #define UBX_REC_TRACE_RXMSG(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* Rx msgs in payload_rx_done() */
-#define UBX_REC_TRACE_SVINFO(...)	{GPS_INFO(__VA_ARGS__);}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
-#define UBX_REC_TRACE_RXID(...)		{GPS_INFO(__VA_ARGS__);}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
+#define UBX_REC_TRACE_SVINFO(...)	{/*GPS_INFO(__VA_ARGS__);*/}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
+#define UBX_REC_TRACE_RXID(...)		{/*GPS_INFO(__VA_ARGS__);*/}	/* NAV-SVINFO processing (debug use only, will cause rx buffer overflows) */
 
 /**** Warning macros, disable to save memory */
 #define UBX_REC_WARN(...)		{/*GPS_WARN(__VA_ARGS__);*/}
