@@ -971,7 +971,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 
 		_gps_position->eph		= (float)_buf.payload_rx_nav_pvt.hAcc * 1e-3f;
 		_gps_position->epv		= (float)_buf.payload_rx_nav_pvt.vAcc * 1e-3f;
-		_gps_position->s_variance_m_s	= (float)_buf.payload_rx_nav_pvt.sAcc * 1e-3f;
+        _gps_position->s_variance_m_s	= (float)_buf.payload_rx_nav_pvt.sAcc * 1e-3f;
 
 		_gps_position->vel_m_s		= (float)_buf.payload_rx_nav_pvt.gSpeed * 1e-3f;
 
@@ -1096,7 +1096,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 //		_gps_position->fix_type		= _buf.payload_rx_nav_sol.gpsFix;
 //		_gps_position->status0		= _buf.payload_rx_nav_sol.flags;
 //		_gps_position->status1		= _buf.payload_rx_nav_sol.flags;//LLQ:20170725
-		_gps_position->s_variance_m_s	= (float)_buf.payload_rx_nav_sol.sAcc * 1e-2f;	// from cm to m
+        _gps_position->s_variance_m_s	= (float)_buf.payload_rx_nav_sol.sAcc * 1e-2f;	// from cm to m
 		_gps_position->satellites_used	= _buf.payload_rx_nav_sol.numSV;
 
 		ret = 1;
@@ -1226,7 +1226,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 		_gps_position->vel_d_m_s	= (float)_buf.payload_rx_nav_velned.velD * 1e-2f; /* NED DOWN velocity */
 		_gps_position->cog_rad		= (float)_buf.payload_rx_nav_velned.heading * M_DEG_TO_RAD_F * 1e-5f;
 		_gps_position->c_variance_rad	= (float)_buf.payload_rx_nav_velned.cAcc * M_DEG_TO_RAD_F * 1e-5f;
-        _gps_position->sAcc				= _buf.payload_rx_nav_velned.sAcc;
+        _gps_position->sacc				= _buf.payload_rx_nav_velned.sAcc;
         _gps_position->vel_ned_valid	= true;
 		if(_buf.payload_rx_nav_velned.iTOW != itow_now){
 			_gps_position->vel_ned_valid = false;
@@ -1237,13 +1237,13 @@ GPSDriverUBX_rec::payloadRxDone(void)
 		_rate_count_vel++;
 		_got_velned = true;
         //by sjj print data
-        PX4_INFO("Rx NAV-VELNED,vel_m_s:%5.4f,vel_n_m_s:%5.4f,vel_e_m_s:%5.4f,vel_d_m_s:%5.4f,cog_rad:%5.4f,sAcc%ld,vel_ned_valid:%ld",
+        PX4_INFO("Rx NAV-VELNED,vel_m_s:%5.4f,vel_n_m_s:%5.4f,vel_e_m_s:%5.4f,vel_d_m_s:%5.4f,cog_rad:%5.4f,sAcc%d,vel_ned_valid:%d",
                  (double)_gps_position->vel_m_s,
                  (double)_gps_position->vel_n_m_s,
                  (double)_gps_position->vel_e_m_s,
                  (double)_gps_position->vel_d_m_s,
                  (double)(_gps_position->cog_rad/M_DEG_TO_RAD_F),
-                 _gps_position->sAcc,
+                 _gps_position->sacc,
                  _gps_position->vel_ned_valid);
 
 		ret = 1;
@@ -1473,8 +1473,8 @@ GPSDriverUBX_rec::print_info(void)
 
 	
 	if(nav_velned && _rx_msg == UBX_MSG_NAV_VELNED){
-		UBX_REC_TRACE_RXMSG("NAV-VELNED info, sAcc:%u, heading:%d", 
-							_buf.payload_rx_nav_velned.sAcc,
+        UBX_REC_TRACE_RXMSG("NAV-VELNED info, sAcc:%u, heading:%d",
+                            _buf.payload_rx_nav_velned.sAcc,
 							_buf.payload_rx_nav_velned.heading);//z
 		nav_velned = false;
 	}
