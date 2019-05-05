@@ -54,7 +54,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctime>
-
 #include "ubx_rec.h"
 
 #define UBX_CONFIG_TIMEOUT	200		// ms, timeout for waiting ACK
@@ -1066,7 +1065,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 
         itow_now = _buf.payload_rx_nav_posllh.iTOW;
         //by sjj
-        //PX4_INFO("itow%lld,lat:%ld,lon:%ld,HMSL:%ld",_buf.payload_rx_nav_posllh.iTOW,_buf.payload_rx_nav_posllh.lat,_buf.payload_rx_nav_posllh.lon,_buf.payload_rx_nav_posllh.hMSL);
+        PX4_INFO("itow%d,lat:%d,lon:%d,HMSL:%d",_buf.payload_rx_nav_posllh.iTOW,_buf.payload_rx_nav_posllh.lat,_buf.payload_rx_nav_posllh.lon,_buf.payload_rx_nav_posllh.hMSL);
 		_gps_position->timestamp = gps_absolute_time();
 
 		_rate_count_lat_lon++;
@@ -1098,7 +1097,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 //		_gps_position->status1		= _buf.payload_rx_nav_sol.flags;//LLQ:20170725
         _gps_position->s_variance_m_s	= (float)_buf.payload_rx_nav_sol.sAcc * 1e-2f;	// from cm to m
 		_gps_position->satellites_used	= _buf.payload_rx_nav_sol.numSV;
-
+        PX4_INFO("number: %d",_gps_position->satellites_used);
 		ret = 1;
 		break;
 
@@ -1172,7 +1171,6 @@ GPSDriverUBX_rec::payloadRxDone(void)
 
 			UBX_REC_DEBUG("Survey-in status: %is cur accuracy: %imm nr obs: %i valid: %i active: %i",
 				  svin.dur, svin.meanAcc / 10, svin.obs, (int)svin.valid, (int)svin.active);
-
 			SurveyInStatus status;
 			status.duration = svin.dur;
 			status.mean_accuracy = svin.meanAcc / 10;
@@ -1224,8 +1222,8 @@ GPSDriverUBX_rec::payloadRxDone(void)
 		_gps_position->vel_n_m_s	= (float)_buf.payload_rx_nav_velned.velN * 1e-2f; /* NED NORTH velocity */
 		_gps_position->vel_e_m_s	= (float)_buf.payload_rx_nav_velned.velE * 1e-2f; /* NED EAST velocity */
 		_gps_position->vel_d_m_s	= (float)_buf.payload_rx_nav_velned.velD * 1e-2f; /* NED DOWN velocity */
-		_gps_position->cog_rad		= (float)_buf.payload_rx_nav_velned.heading * M_DEG_TO_RAD_F * 1e-5f;
-		_gps_position->c_variance_rad	= (float)_buf.payload_rx_nav_velned.cAcc * M_DEG_TO_RAD_F * 1e-5f;
+        _gps_position->cog_rad		= ((float)_buf.payload_rx_nav_velned.heading) * M_DEG_TO_RAD_F * 1e-5f;
+        _gps_position->c_variance_rad	= (float)_buf.payload_rx_nav_velned.cAcc * M_DEG_TO_RAD_F * 1e-5f;
         _gps_position->sacc				= _buf.payload_rx_nav_velned.sAcc;
         _gps_position->vel_ned_valid	= true;
 		if(_buf.payload_rx_nav_velned.iTOW != itow_now){
@@ -1233,7 +1231,13 @@ GPSDriverUBX_rec::payloadRxDone(void)
 		} else {
 			_gps_position->vel_ned_valid = true;
 		}
-		
+        //translate double gps yaw -90 by sjj
+        if(_gps_position->cog_rad/M_DEG_TO_RAD_F>=90.0f&& _gps_position->cog_rad/M_DEG_TO_RAD_F<=360.0f)
+            _gps_position->cog_rad-=90.0f*M_DEG_TO_RAD_F;
+        else if(_gps_position->cog_rad/M_DEG_TO_RAD_F<90.0f)
+            _gps_position->cog_rad= 270.0f*M_DEG_TO_RAD_F + _gps_position->cog_rad;
+        if(_gps_position->cog_rad/M_DEG_TO_RAD_F>=180.0f)
+            _gps_position->cog_rad-=360.0f*M_DEG_TO_RAD_F;
 		_rate_count_vel++;
 		_got_velned = true;
         //by sjj print data
