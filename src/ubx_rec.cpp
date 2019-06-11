@@ -1224,7 +1224,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 		_gps_position->vel_d_m_s	= (float)_buf.payload_rx_nav_velned.velD * 1e-2f; /* NED DOWN velocity */
         _gps_position->cog_rad		= ((float)_buf.payload_rx_nav_velned.heading) * M_DEG_TO_RAD_F * 1e-5f;
         _gps_position->c_variance_rad	= (float)_buf.payload_rx_nav_velned.cAcc * M_DEG_TO_RAD_F * 1e-5f;
-        _gps_position->sacc				= _buf.payload_rx_nav_velned.sAcc;
+        _gps_position->sAcc				= _buf.payload_rx_nav_velned.sAcc;
         _gps_position->vel_ned_valid	= true;
 		if(_buf.payload_rx_nav_velned.iTOW != itow_now){
 			_gps_position->vel_ned_valid = false;
@@ -1247,7 +1247,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
                  (double)_gps_position->vel_e_m_s,
                  (double)_gps_position->vel_d_m_s,
                  (double)(_gps_position->cog_rad/M_DEG_TO_RAD_F),
-                 _gps_position->sacc,
+                 _gps_position->sAcc,
                  _gps_position->vel_ned_valid);
 
 		ret = 1;
