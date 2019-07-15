@@ -56,7 +56,8 @@
 #include <ctime>
 #include "ubx_rec.h"
 
-#define UBX_CONFIG_TIMEOUT	200		// ms, timeout for waiting ACK
+//#define UBX_CONFIG_TIMEOUT	200		// ms, timeout for waiting ACK
+#define UBX_CONFIG_TIMEOUT	100		// ms, timeout for waiting ACK  {by sjj}
 #define UBX_PACKET_TIMEOUT	2		// ms, if now data during this delay assume that full update received
 #define DISABLE_MSG_INTERVAL	1000000		// us, try to disable message with this interval
 
@@ -108,7 +109,8 @@ GPSDriverUBX_rec::configure(unsigned &baudrate, OutputMode output_mode)
 {
 	_configured = true;
 	_output_mode = output_mode;
-	_use_nav_pvt = false;
+    //_use_nav_pvt = false;
+    _use_nav_pvt = true;
 	setBaudrate(115200);
 	return 0;
 }
@@ -936,9 +938,9 @@ GPSDriverUBX_rec::payloadRxDone(void)
 
 	case UBX_MSG_NAV_PVT:
 		UBX_REC_TRACE_RXID("Rx NAV-PVT");
-        PX4_INFO("used PVT");
+        //PX4_INFO("used PVT");
 		//Check if position fix flag is good
-        PX4_INFO("gps:flags:%d",_buf.payload_rx_nav_pvt.flags);// by sjj
+        //PX4_INFO("gps:flags:%d",_buf.payload_rx_nav_pvt.flags);// by sjj
 		if ((_buf.payload_rx_nav_pvt.flags & UBX_RX_NAV_PVT_FLAGS_GNSSFIXOK) == 1) {
 			_gps_position->fix_type		 = _buf.payload_rx_nav_pvt.fixType;
 
@@ -961,7 +963,7 @@ GPSDriverUBX_rec::payloadRxDone(void)
 			_gps_position->fix_type		 = 0;
 			_gps_position->vel_ned_valid = false;
 		}
-
+        PX4_INFO("gps:flags:%d_gps_position->fix_type	%d",_buf.payload_rx_nav_pvt.flags,_gps_position->fix_type);// by sjj
 		_gps_position->satellites_used	= _buf.payload_rx_nav_pvt.numSV;
 
 		_gps_position->lat		= _buf.payload_rx_nav_pvt.lat;
@@ -981,6 +983,8 @@ GPSDriverUBX_rec::payloadRxDone(void)
 		_gps_position->cog_rad		= (float)_buf.payload_rx_nav_pvt.headMot * M_DEG_TO_RAD_F * 1e-5f;
 		_gps_position->c_variance_rad	= (float)_buf.payload_rx_nav_pvt.headAcc * M_DEG_TO_RAD_F * 1e-5f;
         _gps_position->pos_itow		= _buf.payload_rx_nav_pvt.iTOW;
+
+        PX4_INFO("itow%d,lat:%d,lon:%d,HMSL:%d",_buf.payload_rx_nav_pvt.iTOW,_buf.payload_rx_nav_pvt.lat,_buf.payload_rx_nav_pvt.lon,_buf.payload_rx_nav_pvt.hMSL);// by sjj
 
 		//Check if time and date fix flags are good
 		if ((_buf.payload_rx_nav_pvt.valid & UBX_RX_NAV_PVT_VALID_VALIDDATE)
